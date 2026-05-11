@@ -28,17 +28,19 @@
 #include <thread>
 #include <vector>
 
-#include <mujoco/mujoco.h>
-
-#include <mujoco_ros2_control_msgs/srv/reset_world.hpp>
-#include <mujoco_ros2_control_msgs/srv/set_pause.hpp>
-#include <mujoco_ros2_control_msgs/srv/step_simulation.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <realtime_tools/realtime_publisher.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
 
 #include "glfw_adapter.h"  // for mj::GlfwAdapter
 #include "simulate.h"      // must be on your include path, handled by CMake
+
+#include <mujoco/mujoco.h>
+
+#include <mujoco_ros2_control/data.hpp>
+#include <mujoco_ros2_control_msgs/srv/reset_world.hpp>
+#include <mujoco_ros2_control_msgs/srv/set_pause.hpp>
+#include <mujoco_ros2_control_msgs/srv/step_simulation.hpp>
 
 namespace mujoco_ros2_control
 {
@@ -150,22 +152,11 @@ public:
   }
 
   /**
-   * @brief Accessor for the mutex which locks access to the data and model.
+   * @brief Accessor for the plugin_data.
    */
-  std::recursive_mutex& mutex() const
+  PluginData& plugin_data()
   {
-    RCLCPP_WARN_EXPRESSION(logger_, sim_mutex_ == nullptr, "Sim recursive mutex is still nullptr");
-    return *sim_mutex_;
-  }
-
-  /**
-   * @brief Accessor for the stacking applied forces, these values will be added to `xfrc_applied`.
-   *
-   * TODO: Remove this and provide consisted access for write-able mujoco data.
-   */
-  std::vector<mjtNum>& xfrc_plugin_desired()
-  {
-    return xfrc_plugin_desired_;
+    return plugin_data_;
   }
 
   /**
@@ -173,6 +164,41 @@ public:
    * @note Caller must hold the sim mutex.
    */
   void reset_world_state(bool fill_initial_state);
+
+  /**
+   * @brief Copies `mj_model_` into the provided container in a thread safe way.
+   *
+   * This locks the sim mutex and will pause the physics loop, so should be used sparingly.
+   */
+  void copy_mj_model(mjModel* destination);
+
+  /**
+   * @brief Copies `mj_data_` into the provided container in a thread safe way.
+   *
+   * This locks the sim mutex and will pause the physics loop, so should be used sparingly.
+   */
+  void copy_mj_data(mjData* destination);
+
+  /**
+   * @brief Copies the provided mjData into mj_data_ om a thread safe way.
+   */
+  void set_mj_data(mjData* source);
+
+  /**
+   * @brief Copies relevant control data into the sim data in a thread safe way.
+   *
+   * This locks the sim mutex and will pause the physics loop, so should be used sparingly.
+   */
+  void copy_control_data();
+
+  /**
+   * @brief Accessor for the mutex which locks access to the data and model.
+   */
+  std::recursive_mutex& mutex() const
+  {
+    RCLCPP_WARN_EXPRESSION(logger_, sim_mutex_ == nullptr, "Sim recursive mutex is still nullptr");
+    return *sim_mutex_;
+  }
 
 private:
   /**
@@ -218,29 +244,14 @@ private:
   mjModel* mj_model_{ nullptr };
   mjData* mj_data_{ nullptr };
 
-  // Data container for control data. The physics data is copied into this container every
-  // controller loop. This is where the controller should add commands.
+  // Data container for control data. The physics data from `mj_data_` is copied into this
+  // on every loop. The external interface can read as needed from this information.
+  // This is where the controller should add commands for `ctrl` and
+  // `qfrc_applied`.
   mjData* mj_data_control_{ nullptr };
 
-  // TODO: Conslidate the control and these buffer to provide consistent, clear access for
-  //       for mujoco data.
-  //
-  // Dedicated buffer for plugin xfrc contributions.
-  //
-  // mj_copyData contaminates mj_data_control_->xfrc_applied with viewer forces, so we cannot
-  // rely on mj_data_control_->xfrc_applied to hold plugin forces across physics iterations.
-  // Instead, the control thread (read()) zeroes mj_data_control_->xfrc_applied before every
-  // plugin update, lets plugins write fresh forces, then copies the result here.  The physics
-  // thread uses this buffer (not mj_data_control_->xfrc_applied) when composing each mj_step.
-  // Because this buffer is never touched by mj_copyData, it holds the last plugin contribution
-  // cleanly until the next control cycle — no restore and no undo mechanism required.
-  std::vector<mjtNum> xfrc_viewer_capture_;  ///< viewer-only forces (drag), used per inner step
-  std::vector<mjtNum> xfrc_plugin_desired_;  ///< plugin forces, set once per control cycle
-  /// Last value written to mj_data_->xfrc_applied by the physics loop (viewer + plugin).
-  /// Used at the start of each outer iteration to detect whether the render thread ran
-  /// (and zeroed/re-applied drag) since the last physics step.  If mj_data_->xfrc_applied
-  /// matches this buffer, the render thread did not run and xfrc_viewer_capture_ is still valid.
-  std::vector<mjtNum> xfrc_last_restore_;
+  // Data structure to provide access to control and force inputs from plugins.
+  PluginData plugin_data_;
 
   // For rendering
   mjvCamera cam_;

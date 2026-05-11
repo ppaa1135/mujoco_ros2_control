@@ -649,7 +649,10 @@ bool MujocoSimulation::initialize(rclcpp::Node::SharedPtr node, const std::strin
   {
     std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
     mj_data_ = mj_makeData(mj_model_);
+
+    // Initialized containers for data sharing
     mj_data_control_ = mj_makeData(mj_model_);
+    plugin_data_.allocate(mj_model_);
   }
   if (!mj_data_ || !mj_data_control_)
   {
@@ -922,6 +925,35 @@ void MujocoSimulation::step_simulation_callback(
   }
 }
 
+void MujocoSimulation::copy_mj_model(mjModel* destination)
+{
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+  mj_copyModel(destination, mj_model_);
+}
+
+void MujocoSimulation::copy_mj_data(mjData* destination)
+{
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+  if (destination == nullptr)
+  {
+    destination = mj_makeData(mj_model_);
+  }
+  mj_copyData(destination, mj_model_, mj_data_);
+}
+
+void MujocoSimulation::set_mj_data(mjData* source)
+{
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+  mj_copyData(mj_data_, mj_model_, source);
+}
+
+void MujocoSimulation::copy_control_data()
+{
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+  mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, mj_model_->nu);
+  mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, mj_model_->nv);
+}
+
 // simulate in background thread (while rendering in main thread)
 void MujocoSimulation::physics_loop()
 {
@@ -931,12 +963,6 @@ void MujocoSimulation::physics_loop()
 
   // Track previous simulation time to detect UI-triggered resets
   mjtNum prevSimTime = 0;
-
-  // Initialize containers for data sharing
-  // TODO: Update after breaking apart mujoco data.
-  xfrc_viewer_capture_.assign(6 * mj_model_->nbody, 0.0);
-  xfrc_plugin_desired_.assign(6 * mj_model_->nbody, 0.0);
-  xfrc_last_restore_.assign(6 * mj_model_->nbody, 0.0);
 
   // run until asked to exit
   while (!sim_->exitrequest.load())
@@ -979,27 +1005,7 @@ void MujocoSimulation::physics_loop()
       // run only if model is present
       if (mj_model_)
       {
-        // Determine the viewer (drag) forces for this outer iteration.
-        //
-        // mjv_updateScene in simulate.cc reads mj_data_->xfrc_applied BEFORE zeroing it, so
-        // plugin forces written here are visible as arrows in the native viewer.  To avoid
-        // accumulation across outer iterations we must extract only the viewer-drag portion.
-        //
-        // After each outer iteration we restore mj_data_->xfrc_applied = viewer + plugin and
-        // record it in xfrc_last_restore_.  If mj_data_->xfrc_applied still equals that value
-        // the render thread has not run since our last step, so the viewer forces are unchanged
-        // and xfrc_viewer_capture_ remains valid.  If it differs, the render thread ran: it
-        // zeroed xfrc_applied and called mjv_applyPerturbForce, so mj_data_->xfrc_applied now
-        // holds only drag forces — use that as the new viewer capture.
-        const int nbody6 = 6 * mj_model_->nbody;
-        if (std::memcmp(mj_data_->xfrc_applied, xfrc_last_restore_.data(), nbody6 * sizeof(mjtNum)) != 0)
-        {
-          // Render thread ran: xfrc_applied was zeroed then drag was applied.
-          mju_copy(xfrc_viewer_capture_.data(), mj_data_->xfrc_applied, nbody6);
-        }
-        // else: render thread did not run; keep the existing xfrc_viewer_capture_.
-
-        // running
+        // running (ie, not paused)
         if (sim_->run)
         {
           // If the sim was unpaused while a StepSimulation call was in progress,
@@ -1041,14 +1047,8 @@ void MujocoSimulation::physics_loop()
             syncSim = mj_data_->time;
             sim_->speed_changed = false;
 
-            // Copy data to the control
-            mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
-
-            // Restore viewer forces, then add plugin contribution on top.
-            // TODO: Cleanup when mujoco data is split
-            mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-            mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
+            // Add plugin contributions to mj_data_
+            plugin_data_.add_to_data(mj_model_, mj_data_);
 
             // run single step, let next iteration deal with timing
             mj_step(mj_model_, mj_data_);
@@ -1089,25 +1089,13 @@ void MujocoSimulation::physics_loop()
                     static_cast<float>(std::chrono::duration<double>(elapsedCPU).count() / elapsedSim);
                 measured = true;
               }
-// inject noise
-// Use mjVERSION_HEADER and if it is greater than 337 then do one thing or another
-// Needed due to
-// https://github.com/google-deepmind/mujoco/commit/401bf431b8b0fe6e0a619412a607b5135dc4ded4#diff-3dc22ceeebd71304c41d349c6d273bda172ea88ff49c772dbdcf51b9b19bbd33R2943
 #if mjVERSION_HEADER < 337
               sim_->InjectNoise();
 #else
               sim_->InjectNoise(-1);
 #endif
-
-              // Copy data to the control
-              mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-              mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
-
-              // Restore viewer forces, then add plugin contribution (xfrc_plugin_desired_ is only
-              // written by the control thread between outer loop iterations — constant here).
-              // TODO: Cleanup when mujoco data is split
-              mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-              mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
+              // Add plugin contributions to mj_data_
+              plugin_data_.add_to_data(mj_model_, mj_data_);
 
               // call mj_step
               mj_step(mj_model_, mj_data_);
@@ -1141,17 +1129,9 @@ void MujocoSimulation::physics_loop()
           // save current state to history buffer
           if (stepped)
           {
-            // Update the control's read buffers if the data has changed
-            mj_copyData(mj_data_control_, mj_model_, mj_data_);
-
-            // Restore viewer + plugin into mj_data_->xfrc_applied so mjv_updateScene (which
-            // reads it before zeroing) shows plugin force arrows in the native viewer.
-            // Record the value in xfrc_last_restore_ so the next outer iteration can detect
-            // whether the render thread ran and updated xfrc_applied in the interim.
-            // TODO: Cleanup when mujoco data is split
-            mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-            mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
-            mju_copy(xfrc_last_restore_.data(), mj_data_->xfrc_applied, nbody6);
+            // Restore plugin xfrc into mj_data_ so mjv_updateScene shows force arrows
+            // in the native viewer (it reads xfrc_applied before zeroing it).
+            mju_addTo(mj_data_->xfrc_applied, plugin_data_.xfrc_applied.data(), 6 * mj_model_->nbody);
 
             sim_->AddToHistory();
             update_sim_display();
@@ -1172,12 +1152,8 @@ void MujocoSimulation::physics_loop()
           // (try_publish) has time to flush between steps, matching play mode behavior.
           if (pending_steps_.load() > 0)
           {
-            mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
-
-            // TODO: Cleanup when mujoco data is split
-            mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-            mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
+            // Add plugin contributions to mj_data_
+            plugin_data_.add_to_data(mj_model_, mj_data_);
 
             mj_step(mj_model_, mj_data_);
             publish_clock();
@@ -1192,12 +1168,8 @@ void MujocoSimulation::physics_loop()
             }
             else
             {
-              mj_copyData(mj_data_control_, mj_model_, mj_data_);
-
-              // TODO: Cleanup when mujoco data is split
-              mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-              mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
-              mju_copy(xfrc_last_restore_.data(), mj_data_->xfrc_applied, nbody6);
+              // Restore plugin xfrc for viewer arrows
+              mju_addTo(mj_data_->xfrc_applied, plugin_data_.xfrc_applied.data(), 6 * mj_model_->nbody);
 
               sim_->AddToHistory();
               pending_steps_.fetch_sub(1);
@@ -1214,12 +1186,8 @@ void MujocoSimulation::physics_loop()
           }
           else
           {
-            mj_copyData(mj_data_control_, mj_model_, mj_data_);
-
-            // TODO: Cleanup when mujoco data is split
-            mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
-            mju_addTo(mj_data_->xfrc_applied, xfrc_plugin_desired_.data(), nbody6);
-            mju_copy(xfrc_last_restore_.data(), mj_data_->xfrc_applied, nbody6);
+            // Restore plugin xfrc for viewer arrows
+            mju_addTo(mj_data_->xfrc_applied, plugin_data_.xfrc_applied.data(), 6 * mj_model_->nbody);
 
             // run mj_forward, to update rendering and joint sliders
             mj_forward(mj_model_, mj_data_);

@@ -839,6 +839,10 @@ MujocoSystemInterface::perform_command_mode_switch(const std::vector<std::string
 
 hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& time, const rclcpp::Duration& /*period*/)
 {
+  // Snapshot the latest physics state into our local copy to avoid locking.
+  // This locks the sim mutex internally, then all reads below use control_data()
+  simulation_->copy_mj_data(simulation_->control_data());
+
   // Joint states
   actuator_state_msg_.header.stamp = time;
   actuator_state_msg_.position.clear();
@@ -931,18 +935,15 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
   }
 
   // Update plugins.
-  // Zero xfrc_applied first so plugins write fresh forces each control cycle (no undo needed).
-  // After all updates, snapshot the result into xfrc_plugin_desired_ — the physics loop reads
-  // from there so mj_copyData's viewer-force contamination never reaches the plugin buffer.
-  // TODO: Break this apart when mujoco data is separated
-  mju_zero(simulation_->control_data()->xfrc_applied, 6 * simulation_->model()->nbody);
+  // Clear plugin data, then let each plugin update as needed, in order.
+  // The physics loop reads from plugin_data_ before each mj_step.
+  simulation_->plugin_data().clear();
   for (auto& plugin : plugin_instances_)
   {
+    // TODO: Update the plugin interface
+    // plugin->update(simulation_->model(), simulation_->control_data(), simulation_->plugin_data());
     plugin->update(simulation_->model(), simulation_->control_data());
   }
-  mju_copy(simulation_->xfrc_plugin_desired().data(), simulation_->control_data()->xfrc_applied,
-           6 * simulation_->model()->nbody);
-
   return hardware_interface::return_type::OK;
 }
 
@@ -974,8 +975,7 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
 #endif
   };
 
-  // Joint commands
-  // TODO: Support command limits. For now those ranges can be limited in the MuJoCo actuators themselves.
+  // Update control data based on the latest readings
   for (auto& actuator : mujoco_actuator_data_)
   {
     if (actuator.actuator_type == ActuatorType::PASSIVE)
@@ -1007,6 +1007,9 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
       simulation_->control_data()->ctrl[actuator.mj_actuator_id] = actuator.effort_interface.command_;
     }
   }
+
+  // Update the inputs in the underlying sim (this locks)
+  simulation_->copy_control_data();
 
   return hardware_interface::return_type::OK;
 }
@@ -2040,24 +2043,17 @@ void MujocoSystemInterface::reset_simulation_state(bool /*fill_initial_state*/)
 
 void MujocoSystemInterface::get_model(mjModel*& dest)
 {
-  const std::unique_lock<std::recursive_mutex> lock(simulation_->mutex());
-  dest = mj_copyModel(dest, simulation_->model());
+  simulation_->copy_mj_model(dest);
 }
 
 void MujocoSystemInterface::get_data(mjData*& dest)
 {
-  const std::unique_lock<std::recursive_mutex> lock(simulation_->mutex());
-  if (dest == nullptr)
-  {
-    dest = mj_makeData(simulation_->model());
-  }
-  mj_copyData(dest, simulation_->model(), simulation_->data());
+  simulation_->copy_mj_data(dest);
 }
 
 void MujocoSystemInterface::set_data(mjData* mj_data)
 {
-  const std::unique_lock<std::recursive_mutex> lock(simulation_->mutex());
-  mj_copyData(simulation_->data(), simulation_->model(), mj_data);
+  simulation_->set_mj_data(mj_data);
 }
 
 rclcpp::Logger MujocoSystemInterface::get_logger() const
