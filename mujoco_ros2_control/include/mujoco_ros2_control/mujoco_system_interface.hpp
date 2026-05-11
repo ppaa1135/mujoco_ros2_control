@@ -20,6 +20,7 @@
 #pragma once
 
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +37,7 @@
 #include <rclcpp_lifecycle/state.hpp>
 #include <realtime_tools/realtime_publisher.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include <mujoco/mujoco.h>
 
@@ -326,10 +328,40 @@ private:
   std::vector<FTSensorData> ft_sensor_data_;
   std::vector<IMUSensorData> imu_sensor_data_;
 
+  // F/T sensor noise + quantization. Noise is i.i.d. Gaussian per read() call
+  // (white at the read rate). Quantization step matches real-sensor ADC.
+  // std <= 0 disables noise; step <= 0 disables quantization.
+  double ft_noise_force_std_{ 0.0 };
+  double ft_noise_torque_std_{ 0.0 };
+  double ft_quant_force_{ 0.0 };
+  double ft_quant_torque_{ 0.0 };
+  std::mt19937 ft_noise_rng_{ std::random_device{}() };
+  std::normal_distribution<double> ft_noise_dist_{ 0.0, 1.0 };
+
   bool override_mujoco_actuator_positions_{ false };
   bool override_urdf_joint_positions_{ false };
 
   std::string initial_keyframe_ = "";
+
+  // Diagnostic: publishes world-frame poses of MJCF <site> elements named in
+  // the `mujoco_publish_sites` hardware_parameter (comma-separated list).
+  // Empty/unset = feature disabled. Used to cross-check the URDF FK chain
+  // (TF from robot_state_publisher) against what MuJoCo is actually
+  // simulating — divergence is the typical cause of "EE moves in the wrong
+  // direction" symptoms when the same joint values produce different tip
+  // poses under the two models. The MuJoCo site id is cached at activation
+  // time so the RT read() loop only touches array indices, never strings.
+  struct DiagSiteEntry
+  {
+    std::string name;
+    int mj_site_id{ -1 };
+  };
+  std::vector<DiagSiteEntry> diag_sites_;
+  std::shared_ptr<rclcpp::Publisher<tf2_msgs::msg::TFMessage>> diag_site_pose_publisher_ = nullptr;
+  realtime_tools::RealtimePublisher<tf2_msgs::msg::TFMessage>::SharedPtr
+      diag_site_pose_realtime_publisher_ = nullptr;
+  tf2_msgs::msg::TFMessage diag_site_pose_msg_;
+  std::string diag_site_pose_world_frame_id_{ "world" };
 };
 
 }  // namespace mujoco_ros2_control
