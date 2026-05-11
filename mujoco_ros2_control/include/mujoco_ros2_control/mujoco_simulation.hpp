@@ -57,6 +57,21 @@ namespace mujoco_ros2_control
  * underlying simulation - including publishing simulated time to /clock, as well as services
  * for pausing, stepping, and resetting the simulation.
  *
+ * Importantly, the physics loop is intended to run at whatever speed (relative realtime) is
+ * requested by the user. It is important to not interrupt the loop with locking calls that
+ * interact with either the physics sim data, `mj_data_`,  or the model, `mj_model_`.
+ * Instead, consumers of this class are provided with functions to read all sim data and provide
+ * control inputs.
+ *
+ * `copy_mj_data` will lock the sim and do a full copy of the existing `mj_data_` into the
+ * provided container, which can be used as the caller requires.
+ *
+ * `update_control_data` will copy control inputs from `mj_data_control_` in `mj_data_`, add is
+ * the recommended way to send control commands to the underlying sim.
+ *
+ * Lastly, `plugin_data_` is provided to update control inputs or applied forces from plugin
+ * interfaces in a standalone, well structured manner.
+ *
  * Thread safety is still somewhat messy, as callers are provided with a simulation mutex that
  * locks the model and data while the actual mujoco engine moves the sim forward. Callers
  * need to be wary of locking that mutex external to this class, as it can have significant
