@@ -940,7 +940,7 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
   simulation_->plugin_data().clear();
   for (auto& plugin : plugin_instances_)
   {
-    // TODO: Update the plugin interface
+    // TODO: Update the plugin interface accordingly
     // plugin->update(simulation_->model(), simulation_->control_data(), simulation_->plugin_data());
     plugin->update(simulation_->model(), simulation_->control_data());
   }
@@ -1008,8 +1008,8 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
     }
   }
 
-  // Update the inputs in the underlying sim (this locks)
-  simulation_->copy_control_data();
+  // Trigger to simulation to update its control inputs (this locks)
+  simulation_->update_control_data();
 
   return hardware_interface::return_type::OK;
 }

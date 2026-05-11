@@ -947,7 +947,7 @@ void MujocoSimulation::set_mj_data(mjData* source)
   mj_copyData(mj_data_, mj_model_, source);
 }
 
-void MujocoSimulation::copy_control_data()
+void MujocoSimulation::update_control_data()
 {
   const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
   mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, mj_model_->nu);

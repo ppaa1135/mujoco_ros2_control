@@ -136,7 +136,11 @@ public:
   }
 
   /**
-   * @brief Accessor for the mujoco data.
+   * @brief Accessor for the raw mujoco simulation data.
+   *
+   * Users should generally not interact with the physics sim data excepting during setup and
+   * other special circumstances. For "normal" processing it is recommended to use
+   * `control_data` or other containers populated by `copy_mj_data`.
    */
   mjData* data()
   {
@@ -145,6 +149,9 @@ public:
 
   /**
    * @brief Accessor for the mujoco control data.
+   *
+   * Standard container for both providing control inputs through `ctrl` and `qfrc_applied`, along
+   * with access to the underlying mujoco simulation's data.
    */
   mjData* control_data()
   {
@@ -176,20 +183,24 @@ public:
    * @brief Copies `mj_data_` into the provided container in a thread safe way.
    *
    * This locks the sim mutex and will pause the physics loop, so should be used sparingly.
+   * @note If `destination` is empty a new mjData will be allocated.
    */
   void copy_mj_data(mjData* destination);
 
   /**
-   * @brief Copies the provided mjData into mj_data_ om a thread safe way.
+   * @brief Copies the provided mjData into mj_data_ in a thread safe way.
+   *
+   * @note This will completely overwrite the existing data, use with caution!
    */
   void set_mj_data(mjData* source);
 
   /**
-   * @brief Copies relevant control data into the sim data in a thread safe way.
+   * @brief Copies control fields from `mj_data_control_` into the sim data in a thread safe way.
    *
-   * This locks the sim mutex and will pause the physics loop, so should be used sparingly.
+   * Specifically, copies `mj_data_control_->ctrl` and `mj_data_control_->qfrc_applied` into
+   * `mj_data_` to update the hw control inputs for the next iteration of the physics loop.
    */
-  void copy_control_data();
+  void update_control_data();
 
   /**
    * @brief Accessor for the mutex which locks access to the data and model.
@@ -242,12 +253,12 @@ private:
   // MuJoCo data pointers, these are the primary containers used by the physics simulation.
   // It is generally not recommended to interact with them directly.
   mjModel* mj_model_{ nullptr };
+
+  // Primary data container for the physics loop. We do not recommend interacting with this
+  // directly unless you are sure of what you are doing.
   mjData* mj_data_{ nullptr };
 
-  // Data container for control data. The physics data from `mj_data_` is copied into this
-  // on every loop. The external interface can read as needed from this information.
-  // This is where the controller should add commands for `ctrl` and
-  // `qfrc_applied`.
+  // This container provides both state information and control inputs for the system interface.
   mjData* mj_data_control_{ nullptr };
 
   // Data structure to provide access to control and force inputs from plugins.
