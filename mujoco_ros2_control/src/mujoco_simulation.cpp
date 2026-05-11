@@ -1043,7 +1043,7 @@ void MujocoSimulation::physics_loop()
 
             // Copy data to the control
             mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nu));
+            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
 
             // Restore viewer forces, then add plugin contribution on top.
             // TODO: Cleanup when mujoco data is split
@@ -1101,7 +1101,7 @@ void MujocoSimulation::physics_loop()
 
               // Copy data to the control
               mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-              mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nu));
+              mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
 
               // Restore viewer forces, then add plugin contribution (xfrc_plugin_desired_ is only
               // written by the control thread between outer loop iterations — constant here).
@@ -1173,7 +1173,7 @@ void MujocoSimulation::physics_loop()
           if (pending_steps_.load() > 0)
           {
             mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nu));
+            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
 
             // TODO: Cleanup when mujoco data is split
             mju_copy(mj_data_->xfrc_applied, xfrc_viewer_capture_.data(), nbody6);
