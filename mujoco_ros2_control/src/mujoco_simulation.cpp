@@ -782,6 +782,9 @@ void MujocoSimulation::reset_world_state(bool fill_initial_state)
   std::fill(mj_data_->qfrc_applied, mj_data_->qfrc_applied + mj_model_->nv, 0.0);
   std::fill(mj_data_->xfrc_applied, mj_data_->xfrc_applied + 6 * mj_model_->nbody, 0.0);
 
+  // Clear plugin contributions
+  plugin_data_->clear();
+
   // Restore simulation time to preserve ROS clock continuity
   mj_data_->time = saved_time;
 

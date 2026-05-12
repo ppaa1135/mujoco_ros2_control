@@ -87,8 +87,6 @@ public:
    * Triggered by the ~/reset_world service or by a any other reset detected in the physics
    * loop. The callback will be run with the sim mutex but after all data has been restored.
    *
-   * // TODO: Retire this when mujoco data is split.
-   *
    * @param fill_initial_state When true, the caller has not already populated
    *        mj_data_->qpos/qvel/ctrl from a keyframe and the callback should restore the captured
    *        initial state. When false, a keyframe has already been applied.
