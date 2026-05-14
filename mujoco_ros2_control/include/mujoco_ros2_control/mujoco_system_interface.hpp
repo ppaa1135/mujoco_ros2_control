@@ -20,6 +20,7 @@
 #pragma once
 
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -325,6 +326,16 @@ private:
 
   std::vector<FTSensorData> ft_sensor_data_;
   std::vector<IMUSensorData> imu_sensor_data_;
+
+  // F/T sensor noise + quantization. Noise is i.i.d. Gaussian per read() call
+  // (white at the read rate). Quantization step emulates real-sensor ADC.
+  // std <= 0 disables noise; step <= 0 disables quantization.
+  double ft_noise_force_std_{ 0.0 };
+  double ft_noise_torque_std_{ 0.0 };
+  double ft_quant_force_{ 0.0 };
+  double ft_quant_torque_{ 0.0 };
+  std::mt19937 ft_noise_rng_{ std::random_device{}() };
+  std::normal_distribution<double> ft_noise_dist_{ 0.0, 1.0 };
 
   bool override_mujoco_actuator_positions_{ false };
   bool override_urdf_joint_positions_{ false };

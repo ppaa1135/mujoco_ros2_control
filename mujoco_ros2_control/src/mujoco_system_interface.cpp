@@ -23,6 +23,7 @@
 #include <fmt/ranges.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -328,6 +329,16 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
   // Check for headless mode
   const bool headless =
       hardware_interface::parse_bool(get_hardware_parameter(get_hardware_info(), "headless").value_or("false"));
+
+  // F/T sensor noise + quantization parameters. Defaults are off (0.0); opt in via hardware params.
+  ft_noise_force_std_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_noise_force_std").value_or("0.0"));
+  ft_noise_torque_std_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_noise_torque_std").value_or("0.0"));
+  ft_quant_force_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_quant_force").value_or("0.0"));
+  ft_quant_torque_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_quant_torque").value_or("0.0"));
 
   // Construct and start the ROS node spinning
   /// The PIDs config file
@@ -885,16 +896,30 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
         simulation_->control_data()->sensordata[data.linear_acceleration.mj_sensor_index + 2];
   }
 
-  // FT Sensor data
+  // FT Sensor data: add white Gaussian noise (per-axis, i.i.d.) then quantize
+  // to emulate real sensor ADC resolution. std/step values come from hardware
+  // params; step<=0 means "skip quantize", std<=0 means "skip noise".
+  auto quantize = [](double v, double step) { return step > 0.0 ? std::round(v / step) * step : v; };
+  const double f_std = ft_noise_force_std_;
+  const double t_std = ft_noise_torque_std_;
+  const double f_step = ft_quant_force_;
+  const double t_step = ft_quant_torque_;
+  auto sample_noise = [&](double std) { return std > 0.0 ? std * ft_noise_dist_(ft_noise_rng_) : 0.0; };
   for (auto& data : ft_sensor_data_)
   {
-    data.force.data.x() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index];
-    data.force.data.y() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index + 1];
-    data.force.data.z() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index + 2];
+    data.force.data.x() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index] + sample_noise(f_std), f_step);
+    data.force.data.y() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index + 1] + sample_noise(f_std), f_step);
+    data.force.data.z() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index + 2] + sample_noise(f_std), f_step);
 
-    data.torque.data.x() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index];
-    data.torque.data.y() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 1];
-    data.torque.data.z() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 2];
+    data.torque.data.x() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index] + sample_noise(t_std), t_step);
+    data.torque.data.y() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 1] + sample_noise(t_std), t_step);
+    data.torque.data.z() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 2] + sample_noise(t_std), t_step);
   }
 
   // Publish Odometry
