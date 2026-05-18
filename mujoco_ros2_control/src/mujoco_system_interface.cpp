@@ -344,6 +344,14 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
   ft_quant_torque_ =
       std::stod(get_hardware_parameter(get_hardware_info(), "ft_quant_torque").value_or("0.015"));
 
+  // Optional constant transport delay on position commands (ms). At
+  // 1/update_rate the buffer length is ceil(delay_ms / period_ms) cycles.
+  // Models real-robot CAN/EtherCAT + motor-controller queue latency that
+  // produces a near-pure time-shift between command and feedback. The
+  // dynamic 2nd-order lag from kp/kv/inertia stays on top of this shift.
+  command_delay_ms_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "command_delay_ms").value_or("0.0"));
+
   // Construct and start the ROS node spinning
   /// The PIDs config file
   const auto pids_config_file = get_hardware_parameter(get_hardware_info(), "pids_config_file");
@@ -1102,6 +1110,30 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
 #endif
   };
 
+  // Lazy-initialize transport delay ring buffers on the first write() once
+  // the control period is steady. Buffer holds N=ceil(delay_ms / period_ms)
+  // samples, pre-filled with the current commanded position so the first
+  // delay_ms of simulation outputs the startup pose (no NaN spike).
+  if (command_delay_ms_ > 0.0 && !command_delay_buffers_ready_)
+  {
+    const double period_sec = period.seconds();
+    const std::size_t delay_steps =
+        period_sec > 0.0 ? static_cast<std::size_t>(std::ceil(command_delay_ms_ * 1e-3 / period_sec))
+                         : 0;
+    for (auto& actuator : mujoco_actuator_data_)
+    {
+      if (actuator.actuator_type == ActuatorType::PASSIVE)
+      {
+        continue;
+      }
+      actuator.position_command_delay_buffer.assign(delay_steps, actuator.position_interface.command_);
+      actuator.command_delay_idx = 0;
+    }
+    command_delay_buffers_ready_ = true;
+    RCLCPP_INFO(get_logger(), "Command transport delay enabled: %.1f ms (%zu cycles @ %.3f ms period)",
+                command_delay_ms_, delay_steps, period_sec * 1e3);
+  }
+
   // Joint commands
   // TODO: Support command limits. For now those ranges can be limited in the MuJoCo actuators themselves.
   for (auto& actuator : mujoco_actuator_data_)
@@ -1112,7 +1144,19 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
     }
     if (actuator.is_position_control_enabled)
     {
-      simulation_->control_data()->ctrl[actuator.mj_actuator_id] = actuator.position_interface.command_;
+      double cmd = actuator.position_interface.command_;
+      // N-step ring buffer: emit the oldest stored command, overwrite that
+      // slot with the freshly arrived command, then advance the head index.
+      // Empty buffer = delay disabled (default).
+      if (!actuator.position_command_delay_buffer.empty())
+      {
+        const double delayed = actuator.position_command_delay_buffer[actuator.command_delay_idx];
+        actuator.position_command_delay_buffer[actuator.command_delay_idx] = cmd;
+        actuator.command_delay_idx =
+            (actuator.command_delay_idx + 1) % actuator.position_command_delay_buffer.size();
+        cmd = delayed;
+      }
+      simulation_->control_data()->ctrl[actuator.mj_actuator_id] = cmd;
     }
     else if (actuator.is_position_pid_control_enabled)
     {

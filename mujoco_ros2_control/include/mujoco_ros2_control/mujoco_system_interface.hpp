@@ -338,6 +338,14 @@ private:
   std::mt19937 ft_noise_rng_{ std::random_device{}() };
   std::normal_distribution<double> ft_noise_dist_{ 0.0, 1.0 };
 
+  // Constant transport delay applied to position commands before they reach
+  // MuJoCo actuators. Models real-robot communication / motor-controller
+  // queue latency that the instantaneous MuJoCo position actuator lacks.
+  // 0 = disabled. Buffers are sized lazily on the first write() when the
+  // control period is known.
+  double command_delay_ms_{ 0.0 };
+  bool command_delay_buffers_ready_{ false };
+
   bool override_mujoco_actuator_positions_{ false };
   bool override_urdf_joint_positions_{ false };
 
