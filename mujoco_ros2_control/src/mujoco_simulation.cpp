@@ -657,6 +657,15 @@ bool MujocoSimulation::initialize(rclcpp::Node::SharedPtr node, const std::strin
     return false;
   }
 
+  // Size the cross-thread xfrc buffers up front so that the controller_manager RT thread's
+  // first read() can safely call mju_copy into xfrc_plugin_desired_.data() before
+  // physics_loop() has a chance to run its own assign(). Without this, a race between
+  // the RT read and the physics thread's startup yields a nullptr destination and
+  // segfaults inside __memmove (Address not mapped to (nil)).
+  xfrc_viewer_capture_.assign(6 * mj_model_->nbody, 0.0);
+  xfrc_plugin_desired_.assign(6 * mj_model_->nbody, 0.0);
+  xfrc_last_restore_.assign(6 * mj_model_->nbody, 0.0);
+
   return true;
 }
 

@@ -113,6 +113,12 @@ struct MuJoCoActuatorData
   bool has_pos_pid{ false };
   bool has_vel_pid{ false };
 
+  // N-step transport delay ring buffer for position commands. Sized once
+  // on the first write() when the control period is known. Empty = delay
+  // disabled (default).
+  std::vector<double> position_command_delay_buffer{};
+  std::size_t command_delay_idx{ 0 };
+
   void copy_state_to_transmission()
   {
     position_interface.transmission_passthrough_ = position_interface.state_;

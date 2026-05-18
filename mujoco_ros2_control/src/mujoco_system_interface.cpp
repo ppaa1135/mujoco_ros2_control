@@ -23,6 +23,7 @@
 #include <fmt/ranges.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -30,9 +31,12 @@
 #include <mutex>
 #include <new>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include <geometry_msgs/msg/transform_stamped.hpp>
 
 #include <tinyxml2.h>
 #include <unordered_map>
@@ -329,6 +333,25 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
   const bool headless =
       hardware_interface::parse_bool(get_hardware_parameter(get_hardware_info(), "headless").value_or("false"));
 
+  // F/T sensor noise + quantization parameters (defaults preserve prior hard-coded behaviour:
+  // no noise, force step 0.15 N, torque step 0.015 Nm).
+  ft_noise_force_std_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_noise_force_std").value_or("0.0"));
+  ft_noise_torque_std_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_noise_torque_std").value_or("0.0"));
+  ft_quant_force_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_quant_force").value_or("0.15"));
+  ft_quant_torque_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "ft_quant_torque").value_or("0.015"));
+
+  // Optional constant transport delay on position commands (ms). At
+  // 1/update_rate the buffer length is ceil(delay_ms / period_ms) cycles.
+  // Models real-robot CAN/EtherCAT + motor-controller queue latency that
+  // produces a near-pure time-shift between command and feedback. The
+  // dynamic 2nd-order lag from kp/kv/inertia stays on top of this shift.
+  command_delay_ms_ =
+      std::stod(get_hardware_parameter(get_hardware_info(), "command_delay_ms").value_or("0.0"));
+
   // Construct and start the ROS node spinning
   /// The PIDs config file
   const auto pids_config_file = get_hardware_parameter(get_hardware_info(), "pids_config_file");
@@ -512,6 +535,67 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
 
   // Load MuJoCo ROS2 Control plugins
   this->load_mujoco_plugins();
+
+  // ---- Diagnostic site pose publisher ----
+  // Lets a caller compare MuJoCo-simulated tip pose against URDF-FK TF
+  // (robot_state_publisher) to confirm/exclude MJCF<>URDF chain mismatches.
+  // Configured via hardware_parameter `mujoco_publish_sites` (comma-separated
+  // site names). Optional override `mujoco_publish_sites_world_frame_id`
+  // (default "world") sets the header.frame_id used in the published
+  // transforms — useful when the URDF root link is not literally named
+  // "world".
+  {
+    const std::string sites_param =
+        get_hardware_parameter_or(get_hardware_info(), "mujoco_publish_sites", "");
+    diag_site_pose_world_frame_id_ =
+        get_hardware_parameter_or(get_hardware_info(), "mujoco_publish_sites_world_frame_id", "world");
+
+    diag_sites_.clear();
+    if (!sites_param.empty())
+    {
+      std::stringstream ss(sites_param);
+      std::string token;
+      while (std::getline(ss, token, ','))
+      {
+        // trim
+        const size_t a = token.find_first_not_of(" \t");
+        const size_t b = token.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        const std::string name = token.substr(a, b - a + 1);
+        if (name.empty()) continue;
+
+        const int sid = mj_name2id(simulation_->model(), mjOBJ_SITE, name.c_str());
+        if (sid < 0)
+        {
+          RCLCPP_WARN(get_logger(),
+                      "mujoco_publish_sites: site '%s' not found in MJCF, skipping.", name.c_str());
+          continue;
+        }
+        diag_sites_.push_back({name, sid});
+        RCLCPP_INFO(get_logger(), "mujoco_publish_sites: will publish site '%s' (mj id %d)",
+                    name.c_str(), sid);
+      }
+    }
+
+    if (!diag_sites_.empty())
+    {
+      diag_site_pose_publisher_ =
+          get_node()->create_publisher<tf2_msgs::msg::TFMessage>("/mujoco_site_poses", 10);
+      diag_site_pose_realtime_publisher_ =
+          std::make_shared<realtime_tools::RealtimePublisher<tf2_msgs::msg::TFMessage>>(
+              diag_site_pose_publisher_);
+
+      diag_site_pose_msg_.transforms.clear();
+      diag_site_pose_msg_.transforms.reserve(diag_sites_.size());
+      for (const auto& entry : diag_sites_)
+      {
+        geometry_msgs::msg::TransformStamped t;
+        t.header.frame_id = diag_site_pose_world_frame_id_;
+        t.child_frame_id = entry.name;
+        diag_site_pose_msg_.transforms.push_back(t);
+      }
+    }
+  }
 
   RCLCPP_INFO(get_logger(), "on_init complete.");
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -885,16 +969,30 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
         simulation_->control_data()->sensordata[data.linear_acceleration.mj_sensor_index + 2];
   }
 
-  // FT Sensor data
+  // FT Sensor data: add white Gaussian noise (per-axis, i.i.d.) then quantize
+  // to emulate real sensor ADC resolution. std/step values come from hardware
+  // params; step<=0 means "skip quantize", std<=0 means "skip noise".
+  auto quantize = [](double v, double step) { return step > 0.0 ? std::round(v / step) * step : v; };
+  const double f_std = ft_noise_force_std_;
+  const double t_std = ft_noise_torque_std_;
+  const double f_step = ft_quant_force_;
+  const double t_step = ft_quant_torque_;
+  auto sample_noise = [&](double std) { return std > 0.0 ? std * ft_noise_dist_(ft_noise_rng_) : 0.0; };
   for (auto& data : ft_sensor_data_)
   {
-    data.force.data.x() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index];
-    data.force.data.y() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index + 1];
-    data.force.data.z() = -simulation_->control_data()->sensordata[data.force.mj_sensor_index + 2];
+    data.force.data.x() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index] + sample_noise(f_std), f_step);
+    data.force.data.y() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index + 1] + sample_noise(f_std), f_step);
+    data.force.data.z() =
+        quantize(-simulation_->control_data()->sensordata[data.force.mj_sensor_index + 2] + sample_noise(f_std), f_step);
 
-    data.torque.data.x() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index];
-    data.torque.data.y() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 1];
-    data.torque.data.z() = -simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 2];
+    data.torque.data.x() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index] + sample_noise(t_std), t_step);
+    data.torque.data.y() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 1] + sample_noise(t_std), t_step);
+    data.torque.data.z() =
+        quantize(-simulation_->control_data()->sensordata[data.torque.mj_sensor_index + 2] + sample_noise(t_std), t_step);
   }
 
   // Publish Odometry
@@ -943,6 +1041,44 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
   mju_copy(simulation_->xfrc_plugin_desired().data(), simulation_->control_data()->xfrc_applied,
            6 * simulation_->model()->nbody);
 
+  // Diagnostic: publish world-frame poses of registered MJCF sites so the
+  // caller can diff against URDF FK (TF) for the same joint configuration.
+  // site_xpos/site_xmat are populated by mj_forward/mj_step in the physics
+  // thread; control_data() is a copy taken right after step, so values here
+  // are consistent with the joint state we just exported.
+  if (diag_site_pose_realtime_publisher_ && !diag_sites_.empty())
+  {
+    const mjData* d = simulation_->control_data();
+    for (std::size_t i = 0; i < diag_sites_.size(); ++i)
+    {
+      const int sid = diag_sites_[i].mj_site_id;
+      auto& t = diag_site_pose_msg_.transforms[i];
+      t.header.stamp = time;
+
+      const mjtNum* p = d->site_xpos + 3 * sid;
+      t.transform.translation.x = p[0];
+      t.transform.translation.y = p[1];
+      t.transform.translation.z = p[2];
+
+      // MuJoCo stores rotation as row-major 3x3 in site_xmat. Convert to
+      // a unit quaternion (w,x,y,z) using the standard branch-by-trace
+      // formula. mju_mat2Quat exists but takes w,x,y,z output order which
+      // matches the layout below.
+      mjtNum quat_wxyz[4];
+      mju_mat2Quat(quat_wxyz, d->site_xmat + 9 * sid);
+      t.transform.rotation.w = quat_wxyz[0];
+      t.transform.rotation.x = quat_wxyz[1];
+      t.transform.rotation.y = quat_wxyz[2];
+      t.transform.rotation.z = quat_wxyz[3];
+    }
+
+#if ROS_DISTRO_HUMBLE
+    diag_site_pose_realtime_publisher_->tryPublish(diag_site_pose_msg_);
+#else
+    diag_site_pose_realtime_publisher_->try_publish(diag_site_pose_msg_);
+#endif
+  }
+
   return hardware_interface::return_type::OK;
 }
 
@@ -974,6 +1110,30 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
 #endif
   };
 
+  // Lazy-initialize transport delay ring buffers on the first write() once
+  // the control period is steady. Buffer holds N=ceil(delay_ms / period_ms)
+  // samples, pre-filled with the current commanded position so the first
+  // delay_ms of simulation outputs the startup pose (no NaN spike).
+  if (command_delay_ms_ > 0.0 && !command_delay_buffers_ready_)
+  {
+    const double period_sec = period.seconds();
+    const std::size_t delay_steps =
+        period_sec > 0.0 ? static_cast<std::size_t>(std::ceil(command_delay_ms_ * 1e-3 / period_sec))
+                         : 0;
+    for (auto& actuator : mujoco_actuator_data_)
+    {
+      if (actuator.actuator_type == ActuatorType::PASSIVE)
+      {
+        continue;
+      }
+      actuator.position_command_delay_buffer.assign(delay_steps, actuator.position_interface.command_);
+      actuator.command_delay_idx = 0;
+    }
+    command_delay_buffers_ready_ = true;
+    RCLCPP_INFO(get_logger(), "Command transport delay enabled: %.1f ms (%zu cycles @ %.3f ms period)",
+                command_delay_ms_, delay_steps, period_sec * 1e3);
+  }
+
   // Joint commands
   // TODO: Support command limits. For now those ranges can be limited in the MuJoCo actuators themselves.
   for (auto& actuator : mujoco_actuator_data_)
@@ -984,7 +1144,19 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
     }
     if (actuator.is_position_control_enabled)
     {
-      simulation_->control_data()->ctrl[actuator.mj_actuator_id] = actuator.position_interface.command_;
+      double cmd = actuator.position_interface.command_;
+      // N-step ring buffer: emit the oldest stored command, overwrite that
+      // slot with the freshly arrived command, then advance the head index.
+      // Empty buffer = delay disabled (default).
+      if (!actuator.position_command_delay_buffer.empty())
+      {
+        const double delayed = actuator.position_command_delay_buffer[actuator.command_delay_idx];
+        actuator.position_command_delay_buffer[actuator.command_delay_idx] = cmd;
+        actuator.command_delay_idx =
+            (actuator.command_delay_idx + 1) % actuator.position_command_delay_buffer.size();
+        cmd = delayed;
+      }
+      simulation_->control_data()->ctrl[actuator.mj_actuator_id] = cmd;
     }
     else if (actuator.is_position_pid_control_enabled)
     {
